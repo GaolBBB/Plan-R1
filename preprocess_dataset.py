@@ -22,8 +22,8 @@ from datasets import get_plan_scenario_types
 class NuplanDataset(Dataset):
     def __init__(self,
                  root: str,
-                 dir:str,
-                 split: str,
+                 dir:str, # 是指要使用 nuPlan 官方哪一部分原始数据。
+                 split: str, # 要使用官方哪个数据
                  mode: str,
                  transform: Optional[Callable] = None,
                  historical_horizon: float = 2,
@@ -60,9 +60,11 @@ class NuplanDataset(Dataset):
             self._processed_file_names = []
             scenario_mapping = ScenarioMapping(scenario_map=get_scenario_map(), subsample_ratio_override=0.5)
             if self.mode == 'plan':
+                # 用于规划任务，只选择规划相关的场景类型。
                 scenario_types = get_plan_scenario_types()
                 scenario_filter = ScenarioFilter(*get_filter_parameters(limit_total_scenarios=self.limit_total_scenarios, scenario_types=scenario_types))
             elif self.mode == 'pred':
+                # 用于预测任务，选择所有场景类型。
                 scenario_filter = ScenarioFilter(*get_filter_parameters(limit_total_scenarios=self.limit_total_scenarios))
             worker = SingleMachineParallelExecutor(use_process_pool=True)
             builder = NuPlanScenarioBuilder(self.raw_paths, self.map_path, None, None, self.map_version, scenario_mapping=scenario_mapping)
@@ -110,6 +112,7 @@ class NuplanDataset(Dataset):
         return self._processed_paths
 
     def process(self) -> None:
+        # 遍历所有场景调用 process_single_scenario()
         scenario_mapping = ScenarioMapping(scenario_map=get_scenario_map(), subsample_ratio_override=0.5)
         if self.mode == 'plan':
             scenario_types = get_plan_scenario_types()
@@ -143,6 +146,8 @@ class NuplanDataset(Dataset):
             self.process_single_scenario(scenario)
 
     def process_single_scenario(self, scenario: NuPlanScenario) -> None:
+        # 从 scenario 提取 ego/agent/map/tl 特征，每个场景生成一个 .pt
+
         scenario_type = scenario.scenario_type
         scenario_name = scenario.scenario_name
 
@@ -155,18 +160,29 @@ class NuplanDataset(Dataset):
         present_ego_state = scenario.initial_ego_state
         past_ego_state = list(scenario.get_ego_past_trajectory(iteration=0, num_samples=self.num_historical_steps, time_horizon=self.historical_horizon))
         future_ego_state = list(scenario.get_ego_future_trajectory(iteration=0, num_samples=self.num_future_steps, time_horizon=self.future_horizon))
-        ego_state_buffer = past_ego_state + [present_ego_state] + future_ego_state
+        ego_state_buffer = past_ego_state + [present_ego_state] + future_ego_state # 存的是“过去+现在+未来”的多帧ego状态
 
         present_observation = scenario.initial_tracked_objects
         past_observation = list(scenario.get_past_tracked_objects(iteration=0, num_samples=self.num_historical_steps, time_horizon=self.historical_horizon))
         future_observation = list(scenario.get_future_tracked_objects(iteration=0, num_samples=self.num_future_steps, time_horizon=self.future_horizon))
-        observation_buffer = past_observation + [present_observation] + future_observation
+        observation_buffer = past_observation + [present_observation] + future_observation # 存的是“过去+现在+未来”的多帧观测到的所有交通参与者状态
 
         map_api = scenario.map_api
         traffic_lights = scenario.get_traffic_light_status_at_iteration(iteration=0)
         route_roadblock_ids = scenario.get_route_roadblock_ids()
         
-        data.update(get_features(ego_state_buffer, observation_buffer, map_api, traffic_lights, route_roadblock_ids, max_agents=20))
+        data.update(get_features(ego_state_buffer, observation_buffer, map_api, traffic_lights, route_roadblock_ids, max_agents=20)) # 提取特征，返回一个字典
+        '''
+        最后data长这样：
+        {
+            'log_name': '2021.06.07.15.34.12_vegas_00234',
+            'scenario_type': 'lane_change',
+            'ego_features': tensor(shape=[num_frames, num_ego_features]),
+            'agent_features': tensor(shape=[num_agents, num_frames, num_agent_features]),
+            'map_features': {...},
+            'traffic_light_features': tensor(shape=[num_lights, num_frames, feature_dim]),
+        }
+        '''
 
         if f"{scenario_type}-{scenario_name}.pt" in self.train_file_names:
             torch.save(data, os.path.join(self.root, 'nuplan-v1.1', 'splits', f"{self.dir}-processed-{self.mode}-train-PlanR1", f"{scenario_type}-{scenario_name}.pt"))
@@ -186,3 +202,7 @@ if __name__ == '__main__':
     NuplanDataset(root='../nuplan/dataset/', dir='train', split='val', mode='plan', num_total_scenarios=100000)
     NuplanDataset(root='../nuplan/dataset/', dir='train', split='train', mode='pred', num_total_scenarios=1000000)
     NuplanDataset(root='../nuplan/dataset/', dir='train', split='val', mode='pred', num_total_scenarios=1000000)
+    # 先从 dir='train' 的 nuPlan 官方 train DB 中读取所有场景，再随机划分其中的 90% 做 Plan-R1 的 train、10% 做 Plan-R1 的 val（由参数 ratio=0.1 控制）。
+    # 最后会生成四个 processed 文件夹，分别是：
+    # train-processed_file_names-*.pt、 val-processed_file_names-*.pt：用于保存场景文件名列表
+    # train-processed-*.pt、 val-processed-*.pt：用于保存处理后的场景数据，每个场景一个 .pt 文件，是真正的特征。

@@ -1,0 +1,4 @@
+lr-AdamW/pg1,lr-AdamW/pg2,step,val_token_cls_acc,val_cls_loss,val_min_joint_ade,val_min_joint_fde,epoch,train_cls_loss_epoch
+7.5e-05,7.5e-05,0,,,,,,
+,,1,0.0004253509105183184,6.703263759613037,26.394763946533203,50.93883514404297,0,
+,,1,,,,,0,6.860783576965332

@@ -8,7 +8,7 @@ univeral_config: &univeral_config
 
 dataset:
   <<: *univeral_config
-  root: ../nuplan/dataset
+  root: /data/gaosunxiang/nuplan/dataset
   dir: train
 
 dataloader:

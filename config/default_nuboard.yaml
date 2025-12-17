@@ -15,7 +15,7 @@ defaults:
   - override hydra/hydra_logging: none                          # Disable hydra's logging
 
 log_config: False                                  # Whether to log the final config after all overrides and interpolations
-port_number: 5006
+port_number: 5009
 simulation_path: null
 resource_prefix: null
 profiler_path: null

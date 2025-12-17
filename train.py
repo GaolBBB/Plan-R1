@@ -34,13 +34,23 @@ if __name__ == '__main__':
     model_checkpoint = ModelCheckpoint(**config['trainer']['ckpt'])
     lr_monitor = LearningRateMonitor(**config['trainer']['lr_monitor'])
     csv_logger = CSVLogger(**config['trainer']['csv_logger'])
+    # trainer = pl.Trainer(
+    #     strategy=config['trainer']['strategy'],
+    #     devices=config['trainer']['devices'],
+    #     accelerator=config['trainer']['accelerator'],
+    #     callbacks=[model_checkpoint, lr_monitor],
+    #     max_epochs=config['trainer']['max_epochs'],
+    #     logger=csv_logger
+    # )
     trainer = pl.Trainer(
-        strategy=config['trainer']['strategy'],
-        devices=config['trainer']['devices'],
+        strategy='auto',
+        devices=1,
         accelerator=config['trainer']['accelerator'],
         callbacks=[model_checkpoint, lr_monitor],
-        max_epochs=config['trainer']['max_epochs'],
-        logger=csv_logger
+        max_epochs=1,
+        logger=csv_logger,
+        limit_train_batches=2,  # ✅ 只跑 2 个 batch
+        limit_val_batches=1,    # ✅ 不做验证
     )
 
     trainer.fit(model, datamodule)

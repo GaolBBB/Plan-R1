@@ -13,7 +13,7 @@ from metrics import minJointADE, minJointFDE, TokenClsAcc, CumulativeReward
 from rewards import AgentCollisionReward, ObstacleCollisionReward, ComfortReward, ProgressReward, SpeedLimitReward, OnRoadReward, TTCReward 
 from visualization import visualization
 from utils import sample_with_top_k_top_p, move_dict_to_device, transform_point_to_global_coordinate, wrap_angle
-
+import ipdb
 class PlanR1(pl.LightningModule):
     def __init__(self,
                  mode: str,
@@ -142,21 +142,25 @@ class PlanR1(pl.LightningModule):
         self.progress_reward = ProgressReward()
         self.ttc_reward = TTCReward()
 
-    def training_step(self, data: Batch) -> None:
+    def training_step(self, data: Batch) -> None: # 用“真值轨迹”教模型学会“下一个 token 怎么预测”（teacher forcing）。注意是一次同时训练所有时间步
+        # ipdb.set_trace()
         if self.mode == 'pred':
+            # 训练时，因为知道真实完整序列，所以可以并行计算所有时间步下的条件概率损失，不需要一步步滚动采样
             # pred token and reward
-            polygon_embs = self.pred_map_encoder(data=data) 
+            polygon_embs = self.pred_map_encoder(data=data) # 计算地图多边形的表示 [总多边形数, D]
             feat = self.pred_backbone(data=data, g_embs=polygon_embs)
-            logits = self.pred_decoder_head(feat)
+            # ipdb.set_trace()
+            logits = self.pred_decoder_head(feat) # [N, T, num_tokens] 每个agent、每个时间步下的预测分布
             # compute loss
-            target = data['agent']['recon_token'].roll(-1,1)
-            target_mask = data['agent']['recon_token_mask'].roll(-1,1)
+            target = data['agent']['recon_token'].roll(-1,1) # [N, T] 每个agent、每个时间步下的真值 token
+            target_mask = data['agent']['recon_token_mask'].roll(-1,1) # 表示哪些时间步有效
             target_mask[:, -1] = False
-            cls_loss = self.cls_loss(logits[target_mask], target[target_mask])
+            cls_loss = self.cls_loss(logits[target_mask], target[target_mask]) # 确定了当前帧是有效的后，将当前帧下（固定了某个agent、某个t）的运动token的概率分布与该帧真实token分布进行交叉熵损失计算。他是对于每个agent、每个t，一个有效的帧而言的！！反正每个帧都能找到下一帧作为他的真值，所以实现了自回归的并行计算！
             self.log('train_cls_loss', cls_loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=1, sync_dist=True)
             return cls_loss
         
         elif self.mode == 'plan':
+            # ipdb.set_trace()
             advantages, pred_logps, plan_logps, rewards, valid_mask = self.rollout(data)
 
             ratio = (plan_logps - plan_logps.detach()).exp()
@@ -174,28 +178,32 @@ class PlanR1(pl.LightningModule):
 
             return loss
 
-    def pred_inference(self, data: Batch):
+    def pred_inference(self, data: Batch): # 在已经学好的模型上，用“自己预测的 token 一步步往前滚”，生成完整未来轨迹
+        # ipdb.set_trace()
+        # 下面三行就是世界模型
         map_encoder = self.pred_map_encoder
         backbone = self.pred_backbone
         decoder_head = self.pred_decoder_head
 
         polygon_embs = map_encoder(data=data)
-        agent_embs, k_embs_dict = backbone.pre_inference(data=data)
+        agent_embs, k_embs_dict = backbone.pre_inference(data=data) # 只用历史部分初始化内部状态 k_embs_dict，相当于把 RNN/Transformer 的“记忆”准备好。得到agent静态特征和历史特征
 
         for _ in range(self.num_future_intervals):
-            k_embs_dict, k_embs_step = backbone.inference(data=data, g_embs=polygon_embs, a_embs=agent_embs, k_embs_dict=k_embs_dict)
-            logits_step = decoder_head(k_embs_step)
-            action_step = sample_with_top_k_top_p(logits_step.unsqueeze(1), top_k=self.pred_top_k).squeeze(1).squeeze(1)
+            k_embs_dict, k_embs_step = backbone.inference(data=data, g_embs=polygon_embs, a_embs=agent_embs, k_embs_dict=k_embs_dict) # 只算当前“下一个时间段”的 agent 表示
+            logits_step = decoder_head(k_embs_step) # 输出当前步的 token logits
+            action_step = sample_with_top_k_top_p(logits_step.unsqueeze(1), top_k=self.pred_top_k).squeeze(1).squeeze(1) # 从这个分布里采样 motion token
 
-            data = self.transition(data, action_step)
-
-        position = data['agent']['infer_position'][:, self.num_historical_intervals:]
-        heading = data['agent']['infer_heading'][:, self.num_historical_intervals:]
+            data = self.transition(data, action_step) # 把采样出来的 token decode 回 位移 + 朝向，更新到 infer_position / infer_heading 里，相当于把系统“推进一步”。
+        # ipdb.set_trace()
+        # 拿到了 完整未来的预测轨迹。
+        position = data['agent']['infer_position'][:, self.num_historical_intervals:] # 所有 agent 的未来轨迹 [num_agents, num_future_intervals, 2]
+        heading = data['agent']['infer_heading'][:, self.num_historical_intervals:] # 未来朝向
         valid_mask = data['agent']['infer_valid_mask'][:, self.num_historical_intervals:]
 
-        return data, position, heading, valid_mask
+        return data, position, heading, valid_mask # data是带有完整 rollout 之后所有轨迹和 token 的场景数据
 
     def plan_inference(self, data: Batch):
+        # ipdb.set_trace()
         ego_index = data['agent']['ptr'][:-1]
 
         pred_polygon_embs = self.pred_map_encoder(data=data)
@@ -215,7 +223,7 @@ class PlanR1(pl.LightningModule):
             action_step[ego_index] = ego_action_step
 
             data = self.transition(data, action_step)
-
+        # ipdb.set_trace()
         position = data['agent']['infer_position'][:, self.num_historical_intervals:]
         heading = data['agent']['infer_heading'][:, self.num_historical_intervals:]
         valid_mask = data['agent']['infer_valid_mask'][:, self.num_historical_intervals:]
@@ -223,7 +231,9 @@ class PlanR1(pl.LightningModule):
         return data, position, heading, valid_mask
 
     def validation_step(self, data: Batch, batch_idx: int) -> None:
+        # ipdb.set_trace()
         if self.mode == 'pred':
+            # 一直到inference注释，虽然用了和training_step一样的前向过程，但是不会更新梯度，只是为了计算指标，是token 级别的评估
             # pred token and reward
             polygon_embs = self.pred_map_encoder(data=data) 
             feat = self.pred_backbone(data=data, g_embs=polygon_embs)
@@ -235,7 +245,7 @@ class PlanR1(pl.LightningModule):
             cls_loss = self.cls_loss(logits[target_mask], target[target_mask])
             self.log('val_token_cls_acc', self.token_cls_acc(logits[target_mask], target[target_mask]), prog_bar=True, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
             self.log('val_cls_loss', cls_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
-            # inference
+            # inference。上面训练的是每一步在真值token上的生成，这里想看自回归的效果
             _, position, heading, valid_mask = self.pred_inference(data)
 
         elif self.mode == 'plan':
@@ -245,7 +255,7 @@ class PlanR1(pl.LightningModule):
             rewards, _, _ = self.reward_fn(data)
             self.reward.update(rewards)
             self.log('val_reward', self.reward, prog_bar=True, on_step=False, on_epoch=True)
-
+        # 轨迹级别的评估（自回归 rollout + ADE/FDE）
         agent_batch = data['agent']['batch']
         agent_pred_traj = unbatch(position.unsqueeze(1), agent_batch)
         agent_target_traj = unbatch(data['agent']['position'][:, self.num_historical_steps+self.interval::self.interval], agent_batch)
@@ -260,6 +270,8 @@ class PlanR1(pl.LightningModule):
             visualization(data, position, heading)
 
     def freeze_pred_model(self):
+        # ipdb.set_trace()
+
         # eval mode
         self.pred_map_encoder.eval()
         self.pred_backbone.eval()
@@ -274,6 +286,8 @@ class PlanR1(pl.LightningModule):
 
     def on_train_start(self):
         if self.mode == 'plan':
+            # ipdb.set_trace()
+            # 微调开始时，把预训练好的 pred 模型参数 拷贝 到 plan 模型上；同时把 pred 模型 冻结（只当 world model，不更新）。
             self.plan_map_encoder.load_state_dict(self.pred_map_encoder.state_dict())
             self.plan_backbone.load_state_dict(self.pred_backbone.state_dict())
             self.plan_decoder_head.load_state_dict(self.pred_decoder_head.state_dict())
@@ -305,6 +319,7 @@ class PlanR1(pl.LightningModule):
         return next_data
         
     def rollout(self, data):
+        ipdb.set_trace()
         # copy data
         data_list = data.to_data_list()
         data_list_copy = deepcopy(data_list)
@@ -318,20 +333,19 @@ class PlanR1(pl.LightningModule):
         pred_agent_embs, pred_k_embs_dict = self.pred_backbone.pre_inference(data=data)
         plan_polygon_embs = self.plan_map_encoder(data=data)
         plan_agent_embs, plan_k_embs_dict = self.plan_backbone.pre_inference(data=data)
-
         # inference
         for step in range(self.num_future_intervals):
             pred_k_embs_dict, pred_k_embs_step = self.pred_backbone.inference(data=data, g_embs=pred_polygon_embs, a_embs=pred_agent_embs, k_embs_dict=pred_k_embs_dict)
             plan_k_embs_dict, plan_k_embs_step = self.plan_backbone.inference(data=data, g_embs=plan_polygon_embs, a_embs=plan_agent_embs, k_embs_dict=plan_k_embs_dict)
-            
             pred_logits_step = self.pred_decoder_head(pred_k_embs_step)
             plan_logits_step = self.plan_decoder_head(plan_k_embs_step)
 
             action_step = sample_with_top_k_top_p(pred_logits_step.unsqueeze(1), top_k=1).squeeze(1).squeeze(1)
             ego_action_step = sample_with_top_k_top_p(plan_logits_step[ego_index].unsqueeze(1), top_k=self.rollout_top_k).squeeze(1).squeeze(1)
             
-            pred_dist_step = Categorical(logits=pred_logits_step[ego_index])
-            plan_dist_step = Categorical(logits=plan_logits_step[ego_index])
+            pred_dist_step = Categorical(logits=pred_logits_step[ego_index]) # ref策略分布
+            plan_dist_step = Categorical(logits=plan_logits_step[ego_index]) 
+            # 把“ego 这一步选到的动作（token）”在 pred（参考/世界模型） 和 plan（可学习策略） 两个分布下的 log 概率记录下来
             if step == 0:
                 pred_logps = pred_dist_step.log_prob(ego_action_step).unsqueeze(1)
                 plan_logps = plan_dist_step.log_prob(ego_action_step).unsqueeze(1)
@@ -341,7 +355,7 @@ class PlanR1(pl.LightningModule):
 
             action_step[ego_index] = ego_action_step
             data = self.transition(data, action_step)
-
+        ipdb.set_trace()
         rewards, _, valid_mask = self.reward_fn(data)
         advantages = self.compute_ae_process_supervision(rewards, valid_mask)
 
@@ -359,13 +373,14 @@ class PlanR1(pl.LightningModule):
         return advantages
     
     def compute_ae_process_supervision(self, rewards, valid_mask):
+        ipdb.set_trace()
         B, T = rewards.shape
 
-        rewards_reshape = rewards.view(self.num_samples, -1, T).transpose(0, 1)
+        rewards_reshape = rewards.view(self.num_samples, -1, T).transpose(0, 1) # 一个场景下抽样到的num_samples个结果
         valid_mask_reshape = valid_mask.view(self.num_samples, -1, T).transpose(0, 1)
         rewards_reshape = rewards_reshape * valid_mask_reshape.float()
 
-        rewards_mean = rewards_reshape.sum(dim=[1, 2]) / valid_mask_reshape.sum(dim=[1, 2])
+        rewards_mean = rewards_reshape.sum(dim=[1, 2]) / valid_mask_reshape.sum(dim=[1, 2]) # 每个场景下抽样到的num_samples个结果奖励的均值
 
         # normalization
         # rewards_std = (rewards_reshape ** 2).sum(dim=[1, 2]) / valid_mask_reshape.sum(dim=[1, 2]) - rewards_mean ** 2
@@ -375,7 +390,7 @@ class PlanR1(pl.LightningModule):
         # centering + scaling
         rewards_norm = (rewards_reshape - rewards_mean.view(-1, 1, 1)) / self.scaling_factor
 
-        rewards_norm = rewards_norm.transpose(0, 1).reshape(B, T)
+        rewards_norm = rewards_norm.transpose(0, 1).reshape(B, T) # 一次rollout下的所有场景
 
         rewards_norm[~valid_mask] = 0.0
         advantages = torch.zeros_like(rewards_norm)
@@ -384,7 +399,7 @@ class PlanR1(pl.LightningModule):
                 advantages[:, step] = rewards_norm[:, step]
             else:
                 advantages[:, step] = rewards_norm[:, step] + advantages[:, step + 1] * valid_mask[:, step + 1].float()
-
+        ipdb.set_trace()
         return advantages
 
     def reward_fn(self, data):
@@ -411,7 +426,7 @@ class PlanR1(pl.LightningModule):
                  self.ttc_reward_weight * ttc_reward + 
                  self.speed_limit_reward_weight * speed_limit_reward + 
                  self.progress_reward_weight * progress_reward) / (self.comfort_reward_weight + self.ttc_reward_weight + self.speed_limit_reward_weight + self.progress_reward_weight)
-
+        # ipdb.set_trace()
         return reward, done, valid_mask
     
     def configure_optimizers(self):

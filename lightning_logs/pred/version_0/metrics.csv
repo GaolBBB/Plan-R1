@@ -1,0 +1,3 @@
+lr-AdamW/pg1,lr-AdamW/pg2,step,train_cls_loss_epoch,epoch
+7.5e-05,7.5e-05,0,,
+,,1,6.860783576965332,0
