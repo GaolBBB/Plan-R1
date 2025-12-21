@@ -1,0 +1,7 @@
+
+# logs
+lightning_logs/
+# python cache
+__pycache__/
+*.pyc
+
