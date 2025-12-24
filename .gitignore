@@ -4,4 +4,11 @@ lightning_logs/
 # python cache
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 
+# Logs / outputs (按你项目需要增删)
+*.log
+nohup.out
+*.ckpt
+*.png

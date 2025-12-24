@@ -14,6 +14,7 @@ from rewards import AgentCollisionReward, ObstacleCollisionReward, ComfortReward
 from visualization import visualization
 from utils import sample_with_top_k_top_p, move_dict_to_device, transform_point_to_global_coordinate, wrap_angle
 
+import ipdb
 class PlanR1(pl.LightningModule):
     def __init__(self,
                  mode: str,
@@ -157,8 +158,9 @@ class PlanR1(pl.LightningModule):
             return cls_loss
         
         elif self.mode == 'plan':
-            advantages, pred_logps, plan_logps, rewards, valid_mask = self.rollout(data)
-
+            # advantages, pred_logps, plan_logps, rewards, valid_mask = self.rollout(data)
+            advantages, pred_logps, plan_logps, rewards, valid_mask, done, plan_entropies = self.rollout(data)
+            ipdb.set_trace()
             ratio = (plan_logps - plan_logps.detach()).exp()
             policy_loss = - (ratio * advantages * valid_mask).sum() / valid_mask.sum()
 
@@ -166,12 +168,61 @@ class PlanR1(pl.LightningModule):
             kl_loss = (kl_loss * valid_mask).sum() / valid_mask.sum()
 
             loss = policy_loss + self.beta * kl_loss
+            # -----------------------------
+            # 1) 熵统计（RFT阶段熵变化/是否坍塌）
+            # plan_entropies: [B, T]
+            # -----------------------------
+            vm = valid_mask.float()
+            denom = vm.sum().clamp(min=1.0)
 
+            entropy_mean = (plan_entropies * vm).sum() / denom # [B,T]后每个时间步的熵平均,得到一个数
+            entropy_min = plan_entropies.masked_fill(~valid_mask, float('inf')).min() # 所有有效时间步中的最小熵
+            entropy_min = torch.where(torch.isfinite(entropy_min), entropy_min, torch.tensor(0.0, device=entropy_min.device)) #对 entropy_min 张量进行「异常值清洗」—— 将所有无穷大（inf）或非数值（nan）的元素替换为 0.0，有限值的元素保持不变
+
+            # -----------------------------
+            # 2) GRPO组内是否出现“全安全/全不安全”
+            # done: [B, T]，True表示发生不安全/终止事件
+            # 单条轨迹安全：整个T都没有done
+            # -----------------------------
+            traj_safe = ~done.any(dim=1)  # [B]
+            B = traj_safe.shape[0]
+            if B % self.num_samples == 0:
+                traj_safe_g = traj_safe.view(self.num_samples, -1)  # [num_sample, B]
+                frac_all_safe = traj_safe_g.all(dim=0).float().mean() # 一个batch下，一个prompt进行rollout的num_sample个样本全部安全的prompt个数的比例
+                frac_all_unsafe = (~traj_safe_g).all(dim=0).float().mean() # 一个batch下，一个prompt进行rollout的num_sample个样本全部不安全的prompt个数的比例
+                safe_rate = traj_safe_g.float().mean() # 一个batch中所有rollout轨迹里的安全轨迹率
+            else:
+                frac_all_safe = torch.tensor(0.0, device=traj_safe.device)
+                frac_all_unsafe = torch.tensor(0.0, device=traj_safe.device)
+                safe_rate = traj_safe.float().mean()
+
+            # -----------------------------
+            # 3) reward / advantage masked mean/std
+            # rewards/advantages: [B, T]
+            # -----------------------------
+            reward_mean = (rewards * vm).sum() / denom
+            reward_sq_mean = ((rewards ** 2) * vm).sum() / denom
+            reward_std = (reward_sq_mean - reward_mean ** 2).clamp(min=0.0).sqrt()
+
+            adv_mean = (advantages * vm).sum() / denom
+            adv_sq_mean = ((advantages ** 2) * vm).sum() / denom
+            adv_std = (adv_sq_mean - adv_mean ** 2).clamp(min=0.0).sqrt()
             self.log('train_policy_loss', policy_loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=1, sync_dist=True)
             self.log('train_kl_loss', kl_loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=1, sync_dist=True)
             self.log('train_loss', loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=1, sync_dist=True)
             self.log('train_reward', rewards.mean(), prog_bar=True, on_step=True, on_epoch=True, batch_size=1, sync_dist=True)
+            # --- new logs for analysis/plotting ---
+            self.log('train_entropy_mean', entropy_mean, prog_bar=True, on_step=True, on_epoch=True, batch_size=1, sync_dist=True)
+            self.log('train_entropy_min', entropy_min, prog_bar=False, on_step=True, on_epoch=True, batch_size=1, sync_dist=True)
 
+            self.log('train_group_frac_all_safe', frac_all_safe, prog_bar=True, on_step=True, on_epoch=True, batch_size=1, sync_dist=True)
+            self.log('train_group_frac_all_unsafe', frac_all_unsafe, prog_bar=True, on_step=True, on_epoch=True, batch_size=1, sync_dist=True)
+            self.log('train_group_safe_rate', safe_rate, prog_bar=False, on_step=True, on_epoch=True, batch_size=1, sync_dist=True)
+
+            self.log('train_reward_mean_masked', reward_mean, prog_bar=False, on_step=True, on_epoch=True, batch_size=1, sync_dist=True)
+            self.log('train_reward_std_masked', reward_std, prog_bar=False, on_step=True, on_epoch=True, batch_size=1, sync_dist=True)
+            self.log('train_adv_mean_masked', adv_mean, prog_bar=False, on_step=True, on_epoch=True, batch_size=1, sync_dist=True)
+            self.log('train_adv_std_masked', adv_std, prog_bar=False, on_step=True, on_epoch=True, batch_size=1, sync_dist=True)
             return loss
 
     def pred_inference(self, data: Batch):
@@ -312,6 +363,8 @@ class PlanR1(pl.LightningModule):
             data_list += data_list_copy
         data = Batch.from_data_list(data_list)
         ego_index = data['agent']['ptr'][:-1]
+        # ipdb> data['log_name']
+        # ['2718', '1521', '3036', '0967', '2718', '1521', '3036', '0967','2718', '1521', '3036', '0967','2718', '1521', '3036', '0967',]
 
         # initialize
         pred_polygon_embs = self.pred_map_encoder(data=data)
@@ -332,20 +385,25 @@ class PlanR1(pl.LightningModule):
             
             pred_dist_step = Categorical(logits=pred_logits_step[ego_index])
             plan_dist_step = Categorical(logits=plan_logits_step[ego_index])
+            plan_entropy_step = plan_dist_step.entropy().unsqueeze(1)  # [B, 1]
             if step == 0:
                 pred_logps = pred_dist_step.log_prob(ego_action_step).unsqueeze(1)
                 plan_logps = plan_dist_step.log_prob(ego_action_step).unsqueeze(1)
+                plan_entropies = plan_entropy_step
             else:
                 pred_logps = torch.cat([pred_logps, pred_dist_step.log_prob(ego_action_step).unsqueeze(1)], dim=1)
                 plan_logps = torch.cat([plan_logps, plan_dist_step.log_prob(ego_action_step).unsqueeze(1)], dim=1)
-
+                plan_entropies = torch.cat([plan_entropies, plan_entropy_step], dim=1) #最终[B,T]，即每个时间步下这个分布的熵
             action_step[ego_index] = ego_action_step
             data = self.transition(data, action_step)
 
-        rewards, _, valid_mask = self.reward_fn(data)
+        # rewards, _, valid_mask = self.reward_fn(data)
+        rewards, done, valid_mask = self.reward_fn(data)
+
         advantages = self.compute_ae_process_supervision(rewards, valid_mask)
 
-        return advantages, pred_logps, plan_logps, rewards, valid_mask
+        # return advantages, pred_logps, plan_logps, rewards, valid_mask
+        return advantages, pred_logps, plan_logps, rewards, valid_mask, done, plan_entropies
     
     def compute_ae_outcome_supervision(self, rewards):
         # group computation
@@ -360,12 +418,12 @@ class PlanR1(pl.LightningModule):
     
     def compute_ae_process_supervision(self, rewards, valid_mask):
         B, T = rewards.shape
-
+        ipdb.set_trace()
         rewards_reshape = rewards.view(self.num_samples, -1, T).transpose(0, 1)
         valid_mask_reshape = valid_mask.view(self.num_samples, -1, T).transpose(0, 1)
         rewards_reshape = rewards_reshape * valid_mask_reshape.float()
 
-        rewards_mean = rewards_reshape.sum(dim=[1, 2]) / valid_mask_reshape.sum(dim=[1, 2])
+        rewards_mean = rewards_reshape.sum(dim=[1, 2]) / valid_mask_reshape.sum(dim=[1, 2]) # torch.Size([4,4,16])-> torch.Size([4])
 
         # normalization
         # rewards_std = (rewards_reshape ** 2).sum(dim=[1, 2]) / valid_mask_reshape.sum(dim=[1, 2]) - rewards_mean ** 2
