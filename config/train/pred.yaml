@@ -8,7 +8,7 @@ univeral_config: &univeral_config
 
 datamodule:
   <<: *univeral_config
-  root: ../nuplan/dataset
+  root: /data/gaosunxiang/nuplan/dataset
   dir: train
   train_batch_size: 8
   val_batch_size: 16
@@ -52,3 +52,7 @@ model:
   warmup_epochs: 4
   T_max: 32
   val_visualization: False
+  sft_ul_enable: True
+  sft_ul_weight: 100
+  sft_ul_top_k: 20
+  sft_ul_label_smoothing: 0.1

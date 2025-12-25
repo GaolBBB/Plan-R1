@@ -42,5 +42,15 @@ if __name__ == '__main__':
         max_epochs=config['trainer']['max_epochs'],
         logger=csv_logger
     )
+    # trainer = pl.Trainer(
+    #     strategy='auto',
+    #     devices=1,
+    #     accelerator=config['trainer']['accelerator'],
+    #     callbacks=[model_checkpoint, lr_monitor],
+    #     max_epochs=1,
+    #     logger=csv_logger,
+    #     limit_train_batches=2,  # ✅ 只跑 2 个 batch
+    #     limit_val_batches=1,    # ✅ 不做验证
+    # )
 
     trainer.fit(model, datamodule)
