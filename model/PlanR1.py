@@ -48,7 +48,13 @@ class PlanR1(pl.LightningModule):
                  sft_ul_enable: bool = False,
                  sft_ul_weight: float = 1.0,
                  sft_ul_top_k: int = 20,
-                 sft_ul_label_smoothing: float = 0.1
+                 sft_ul_label_smoothing: float = 0.1,
+                 rft_ul_enable: bool = False,
+                 rft_ul_weight: float = 1.0,
+                 rft_ul_backtrack_steps: int = 1, # 只向前惩罚一步
+                 rft_ul_backtrack_gamma: float = 0.5, # 前一步权重惩罚系数
+                 rft_ul_nearmiss_weight: float = 0.3, # near-miss 的惩罚权重
+                 rft_ul_ttc_threshold: float = 0.5 # # TTCReward 输出是0/1 (1=安全,0=危险/near-miss), <0.5 表示 near-miss
                  ) -> None:
         super(PlanR1, self).__init__()
         self.save_hyperparameters()
@@ -90,6 +96,13 @@ class PlanR1(pl.LightningModule):
         self.sft_ul_enable = sft_ul_enable
         self.sft_ul_weight = sft_ul_weight
         self.sft_ul_top_k = sft_ul_top_k
+        # RFT (plan) sequence-level unlikelihood (UL) settings
+        self.rft_ul_enable = rft_ul_enable
+        self.rft_ul_weight = rft_ul_weight
+        self.rft_ul_backtrack_steps = int(rft_ul_backtrack_steps)
+        self.rft_ul_backtrack_gamma = float(rft_ul_backtrack_gamma)
+        self.rft_ul_nearmiss_weight = float(rft_ul_nearmiss_weight)
+        self.rft_ul_ttc_threshold = float(rft_ul_ttc_threshold)
 
         # pred model
         self.pred_backbone = Backbone(
@@ -189,7 +202,7 @@ class PlanR1(pl.LightningModule):
         
         elif self.mode == 'plan':
             # advantages, pred_logps, plan_logps, rewards, valid_mask = self.rollout(data)
-            advantages, pred_logps, plan_logps, rewards, valid_mask, done, plan_entropies = self.rollout(data)
+            advantages, pred_logps, plan_logps, rewards, valid_mask, done, plan_entropies, ttc_reward = self.rollout(data)
             # ipdb.set_trace()
             ratio = (plan_logps - plan_logps.detach()).exp()
             policy_loss = - (ratio * advantages * valid_mask).sum() / valid_mask.sum()
@@ -198,6 +211,77 @@ class PlanR1(pl.LightningModule):
             kl_loss = (kl_loss * valid_mask).sum() / valid_mask.sum()
 
             loss = policy_loss + self.beta * kl_loss
+            # -------------------------------------------------
+            # RFT sequence-level unlikelihood (UL):
+            #   - hard unsafe: first done step + weighted backtrack (t0-1, ...)
+            #   - near-miss: TTC < threshold
+            # Uses plan_logps directly: p = exp(logp), UL = -log(1-p)
+            # -------------------------------------------------
+            if self.rft_ul_enable:
+                ipdb.set_trace()
+                device = plan_logps.device
+                B, T = plan_logps.shape
+                eps = 1e-6
+
+                vm = valid_mask.float()
+
+                # ---------- (1) hard unsafe: first done step (+ backtrack with decay) ----------
+                neg_w = torch.zeros((B, T), device=device, dtype=torch.float32)
+                has_done = done.any(dim=1)  # [B]
+                if bool(has_done.any()):
+                    t0 = done.float().argmax(dim=1)  # first True index for each traj 
+                    b_idx = torch.arange(B, device=device)
+
+                    b0 = b_idx[has_done] # 一个batch中所有不安全的轨迹idx
+                    t0v = t0[has_done] # 每个不安全的轨迹的第一个不安全的时间步
+                    neg_w[b0, t0v] = 1.0  # weight for first done step
+
+                    # backtrack: penalize t0-1 with gamma (and optionally more steps with gamma^l)
+                    L = int(self.rft_ul_backtrack_steps)
+                    gamma = float(self.rft_ul_backtrack_gamma)
+                    for l in range(1, L + 1):
+                        bt_mask = has_done & (t0 >= l)
+                        if not bool(bt_mask.any()):
+                            continue
+                        b_bt = b_idx[bt_mask]
+                        t_bt = t0[bt_mask] - l
+                        w_bt = gamma ** l
+                        prev = neg_w[b_bt, t_bt]
+                        neg_w[b_bt, t_bt] = torch.maximum(prev, torch.full_like(prev, w_bt))
+
+                # ---------- (2) near-miss: TTC < threshold ----------
+                # Expect ttc_reward to be [B, T]. If shape differs, tell me and we'll adapt.
+                near_mask = (ttc_reward < float(self.rft_ul_ttc_threshold))
+                near_w = near_mask.float() * float(self.rft_ul_nearmiss_weight)
+
+                # Combine (take max weight if overlaps)
+                neg_w = torch.maximum(neg_w, near_w)
+
+                # Apply valid mask
+                neg_w = neg_w * vm
+
+                # ---------- compute weighted UL ----------
+                neg_denom = neg_w.sum().clamp(min=1.0)
+                p = plan_logps.exp().clamp(min=0.0, max=1.0 - eps)
+                ul_per_step = -torch.log1p(-p)  # [B, T]
+                rft_ul_loss = (ul_per_step * neg_w).sum() / neg_denom
+
+                weighted_rft_ul_loss = float(self.rft_ul_weight) * rft_ul_loss
+                loss = loss + weighted_rft_ul_loss
+
+                # ---------- logs (diagnostics) ----------
+                valid_denom = vm.sum().clamp(min=1.0)
+                neg_step_rate = (neg_w > 0).float().sum() / valid_denom
+                near_miss_rate = (near_mask & valid_mask).float().sum() / valid_denom
+                done_traj_rate = has_done.float().mean()
+                mean_p_neg = p[neg_w > 0].mean() if bool((neg_w > 0).any()) else torch.zeros((), device=device)
+
+                self.log('train_rft_ul_loss', rft_ul_loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=1, sync_dist=True)
+                self.log('train_rft_ul_loss_weighted', weighted_rft_ul_loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=1, sync_dist=True)
+                self.log('train_rft_neg_step_rate', neg_step_rate, prog_bar=False, on_step=True, on_epoch=True, batch_size=1, sync_dist=True)
+                self.log('train_rft_near_miss_rate', near_miss_rate, prog_bar=False, on_step=True, on_epoch=True, batch_size=1, sync_dist=True)
+                self.log('train_rft_done_traj_rate', done_traj_rate, prog_bar=False, on_step=True, on_epoch=True, batch_size=1, sync_dist=True)
+                self.log('train_rft_mean_p_neg', mean_p_neg, prog_bar=False, on_step=True, on_epoch=True, batch_size=1, sync_dist=True)
             # -----------------------------
             # 1) 熵统计（RFT阶段熵变化/是否坍塌）
             # plan_entropies: [B, T]
@@ -323,7 +407,7 @@ class PlanR1(pl.LightningModule):
             # inference
             data, position, heading, valid_mask = self.plan_inference(data)
             # compute rewards
-            rewards, _, _ = self.reward_fn(data)
+            rewards, _, _ , _= self.reward_fn(data)
             self.reward.update(rewards)
             self.log('val_reward', self.reward, prog_bar=True, on_step=False, on_epoch=True)
 
@@ -428,12 +512,12 @@ class PlanR1(pl.LightningModule):
             data = self.transition(data, action_step)
 
         # rewards, _, valid_mask = self.reward_fn(data)
-        rewards, done, valid_mask = self.reward_fn(data)
+        rewards, done, valid_mask, ttc_reward = self.reward_fn(data)
 
         advantages = self.compute_ae_process_supervision(rewards, valid_mask)
 
         # return advantages, pred_logps, plan_logps, rewards, valid_mask
-        return advantages, pred_logps, plan_logps, rewards, valid_mask, done, plan_entropies
+        return advantages, pred_logps, plan_logps, rewards, valid_mask, done, plan_entropies, ttc_reward
     
     def compute_ae_outcome_supervision(self, rewards):
         # group computation
@@ -686,7 +770,7 @@ class PlanR1(pl.LightningModule):
                  self.speed_limit_reward_weight * speed_limit_reward + 
                  self.progress_reward_weight * progress_reward) / (self.comfort_reward_weight + self.ttc_reward_weight + self.speed_limit_reward_weight + self.progress_reward_weight)
 
-        return reward, done, valid_mask
+        return reward, done, valid_mask, ttc_reward
     
     def configure_optimizers(self):
         decay = set()

@@ -8,7 +8,7 @@ univeral_config: &univeral_config
 
 datamodule:
   <<: *univeral_config
-  root: ../nuplan/dataset
+  root: /data/gaosunxiang/nuplan/dataset
   dir: train
   train_batch_size: 4
   val_batch_size: 4
@@ -61,3 +61,9 @@ model:
   ttc_reward_weight: 5
   speed_limit_reward_weight: 2
   progress_reward_weight: 1
+  rft_ul_enable: True
+  rft_ul_weight: 1.0
+  rft_ul_backtrack_steps: 1 # 只向前惩罚一步
+  rft_ul_backtrack_gamma: 0.5 # 前一步权重惩罚系数
+  rft_ul_nearmiss_weight: 0.3 # near-miss 的惩罚权重
+  rft_ul_ttc_threshold: 0.5 # TTCReward 输出是0/1 (1=安全,0=危险/near-miss), <0.5 表示 near-miss
