@@ -1,17 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-# 在v1基础上增加了train_top1_unsafe_rate_step和train_unsafe_prob_mass_step这两个指标的可视化逻辑
+'''
+在v2 基础上完成升级：原有所有图的逻辑都不变，只额外加了刚才新增 log 的 3 个指标的可视化，并附带加了一张“解释矛盾”的 share 图。
+新增会输出的 4 张图
+	1.	train_top1_eq_gt_rate_step.png
+	2.	train_gt_unsafe_rate_step.png
+	3.	train_top1_unsafe_rate_non_gt_step.png
+	4.	share_top1_unsafe_non_gt.png（额外诊断：non-GT 的 top1 unsafe 占全部 top1 unsafe 的比例）
+
+python /home/gaosunxiang/Plan-R1/analysis/plot_pred_metrics_v4.py \
+  --csv  /home/gaosunxiang/Plan-R1/lightning_logs/pred/version_3 \
+  --outdir /home/gaosunxiang/Plan-R1/lightning_logs/pred/version_3/plots_diag \
+  --smooth 50 \
+  --sft_ul_weight 100
+'''
+
 import argparse
 import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-# python /home/gaosunxiang/Plan-R1/analysis/plot_pred_metrics_v2.py \
-#   --csv  /home/gaosunxiang/Plan-R1/lightning_logs/pred/version_1/metrics.csv \
-#   --outdir /home/gaosunxiang/Plan-R1/lightning_logs/pred/version_1/plots_ul_weight100 \
-#   --smooth 50 \
-#   --sft_ul_weight 100
+
 def _to_numeric(s):
     return pd.to_numeric(s, errors="coerce")
 
@@ -26,10 +36,14 @@ def load_metrics(csv_path: str) -> pd.DataFrame:
             "step", "epoch",
             "train_cls_loss_step", "train_ul_loss_step",
             "train_ul_hit_rate_step", "train_ul_unsafe_frac_step",
-            "train_top1_unsafe_rate_step", "train_unsafe_prob_mass_step",
+            "train_top1_unsafe_rate_step",
+            "train_top1_eq_gt_rate_step", "train_gt_unsafe_rate_step", "train_top1_unsafe_rate_non_gt_step",
+            "train_unsafe_prob_mass_step",
             "train_cls_loss_epoch", "train_ul_loss_epoch",
             "train_ul_hit_rate_epoch", "train_ul_unsafe_frac_epoch",
-            "train_top1_unsafe_rate_epoch", "train_unsafe_prob_mass_epoch",
+            "train_top1_unsafe_rate_epoch",
+            "train_top1_eq_gt_rate_epoch", "train_gt_unsafe_rate_epoch", "train_top1_unsafe_rate_non_gt_epoch",
+            "train_unsafe_prob_mass_epoch",
             "val_token_cls_acc", "val_cls_loss",
             "val_min_joint_ade", "val_min_joint_fde",
         ]:
@@ -120,6 +134,18 @@ def main():
                    os.path.join(args.outdir, "train_top1_unsafe_rate_step.png"),
                    title="train_top1_unsafe_rate_step vs step", smooth=args.smooth)
 
+    save_line_plot(df, "step", "train_top1_eq_gt_rate_step",
+                   os.path.join(args.outdir, "train_top1_eq_gt_rate_step.png"),
+                   title="train_top1_eq_gt_rate_step vs step", smooth=args.smooth)
+
+    save_line_plot(df, "step", "train_gt_unsafe_rate_step",
+                   os.path.join(args.outdir, "train_gt_unsafe_rate_step.png"),
+                   title="train_gt_unsafe_rate_step vs step", smooth=args.smooth)
+
+    save_line_plot(df, "step", "train_top1_unsafe_rate_non_gt_step",
+                   os.path.join(args.outdir, "train_top1_unsafe_rate_non_gt_step.png"),
+                   title="train_top1_unsafe_rate_non_gt_step vs step", smooth=args.smooth)
+
     save_line_plot(df, "step", "train_unsafe_prob_mass_step",
                    os.path.join(args.outdir, "train_unsafe_prob_mass_step_log.png"),
                    title="train_unsafe_prob_mass_step vs step (log y)", y_log=True, smooth=args.smooth)
@@ -207,6 +233,24 @@ def main():
             print("[WARN] UL/CLS ratio median is 0 or invalid; cannot suggest weight.")
     else:
         print("[WARN] not enough data to compute UL/CLS ratio.")
+
+    # Extra diagnostic: how much of top1_unsafe comes from non-GT positions
+    sub3 = df[["step", "train_top1_unsafe_rate_step", "train_top1_unsafe_rate_non_gt_step"]].dropna()
+    if not sub3.empty:
+        share = (sub3["train_top1_unsafe_rate_non_gt_step"] / (sub3["train_top1_unsafe_rate_step"] + 1e-12)).replace([np.inf, -np.inf], np.nan)
+        tmp3 = pd.DataFrame({"step": sub3["step"], "non_gt_share": share}).dropna()
+        plt.figure(figsize=(10, 5))
+        y3 = rolling_mean(tmp3["non_gt_share"], args.smooth) if args.smooth else tmp3["non_gt_share"]
+        plt.plot(tmp3["step"], y3, linewidth=1.2)
+        plt.xlabel("step")
+        plt.ylabel("top1_unsafe_rate_non_gt / top1_unsafe_rate")
+        plt.title("Share of top1 unsafe coming from non-GT positions")
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        out_path3 = os.path.join(args.outdir, "share_top1_unsafe_non_gt.png")
+        plt.savefig(out_path3, dpi=200)
+        plt.close()
+        print(f"[OK] saved: {out_path3}")
 
     print(f"\nDone. Figures are in: {os.path.abspath(args.outdir)}")
 

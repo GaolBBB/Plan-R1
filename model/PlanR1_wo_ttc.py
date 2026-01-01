@@ -14,7 +14,7 @@ from rewards import AgentCollisionReward, ObstacleCollisionReward, ComfortReward
 from visualization import visualization
 from utils import sample_with_top_k_top_p, move_dict_to_device, transform_point_to_global_coordinate, wrap_angle
 
-import ipdb
+# import ipdb
 class PlanR1(pl.LightningModule):
     def __init__(self,
                  mode: str,
@@ -103,7 +103,6 @@ class PlanR1(pl.LightningModule):
         self.rft_ul_backtrack_gamma = float(rft_ul_backtrack_gamma)
         self.rft_ul_nearmiss_weight = float(rft_ul_nearmiss_weight)
         self.rft_ul_ttc_threshold = float(rft_ul_ttc_threshold)
-
         # pred model
         self.pred_backbone = Backbone(
             token_dict=self.token_dict,
@@ -196,10 +195,6 @@ class PlanR1(pl.LightningModule):
                 self.log('train_ul_unsafe_frac', ul_stats['unsafe_frac'], prog_bar=False, on_step=True, on_epoch=True, batch_size=1, sync_dist=True)
                 self.log('train_top1_unsafe_rate', ul_stats['top1_unsafe_rate'], prog_bar=False, on_step=True, on_epoch=True, batch_size=1, sync_dist=True)
                 self.log('train_unsafe_prob_mass', ul_stats['unsafe_prob_mass'], prog_bar=False, on_step=True, on_epoch=True, batch_size=1, sync_dist=True)
-                # --- diagnostics to explain top1_unsafe behavior ---
-                self.log('train_top1_eq_gt_rate', ul_stats['top1_eq_gt_rate'], prog_bar=False, on_step=True, on_epoch=True, batch_size=1, sync_dist=True)
-                self.log('train_gt_unsafe_rate', ul_stats['gt_unsafe_rate'], prog_bar=False, on_step=True, on_epoch=True, batch_size=1, sync_dist=True)
-                self.log('train_top1_unsafe_rate_non_gt', ul_stats['top1_unsafe_rate_non_gt'], prog_bar=False, on_step=True, on_epoch=True, batch_size=1, sync_dist=True)
                 return loss
 
             return cls_loss
@@ -255,11 +250,13 @@ class PlanR1(pl.LightningModule):
 
                 # ---------- (2) near-miss: TTC < threshold ----------
                 # Expect ttc_reward to be [B, T]. If shape differs, tell me and we'll adapt.
-                near_mask = (ttc_reward < float(self.rft_ul_ttc_threshold))
-                near_w = near_mask.float() * float(self.rft_ul_nearmiss_weight)
 
-                # Combine (take max weight if overlaps)
-                neg_w = torch.maximum(neg_w, near_w)
+                #暂时去掉了ttc soft loss
+                # near_mask = (ttc_reward < float(self.rft_ul_ttc_threshold))
+                # near_w = near_mask.float() * float(self.rft_ul_nearmiss_weight)
+
+                # # Combine (take max weight if overlaps)
+                # neg_w = torch.maximum(neg_w, near_w)
 
                 # Apply valid mask
                 neg_w = neg_w * vm
@@ -276,14 +273,14 @@ class PlanR1(pl.LightningModule):
                 # ---------- logs (diagnostics) ----------
                 valid_denom = vm.sum().clamp(min=1.0)
                 neg_step_rate = (neg_w > 0).float().sum() / valid_denom
-                near_miss_rate = (near_mask & valid_mask).float().sum() / valid_denom
+                # near_miss_rate = (near_mask & valid_mask).float().sum() / valid_denom
                 done_traj_rate = has_done.float().mean()
                 mean_p_neg = p[neg_w > 0].mean() if bool((neg_w > 0).any()) else torch.zeros((), device=device)
 
                 self.log('train_rft_ul_loss', rft_ul_loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=1, sync_dist=True)
                 self.log('train_rft_ul_loss_weighted', weighted_rft_ul_loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=1, sync_dist=True)
                 self.log('train_rft_neg_step_rate', neg_step_rate, prog_bar=False, on_step=True, on_epoch=True, batch_size=1, sync_dist=True)
-                self.log('train_rft_near_miss_rate', near_miss_rate, prog_bar=False, on_step=True, on_epoch=True, batch_size=1, sync_dist=True)
+                # self.log('train_rft_near_miss_rate', near_miss_rate, prog_bar=False, on_step=True, on_epoch=True, batch_size=1, sync_dist=True)
                 self.log('train_rft_done_traj_rate', done_traj_rate, prog_bar=False, on_step=True, on_epoch=True, batch_size=1, sync_dist=True)
                 self.log('train_rft_mean_p_neg', mean_p_neg, prog_bar=False, on_step=True, on_epoch=True, batch_size=1, sync_dist=True)
             # -----------------------------
@@ -598,15 +595,6 @@ class PlanR1(pl.LightningModule):
         top1_total_count = torch.zeros((), device=device)
         unsafe_mass_total = torch.zeros((), device=device)
         unsafe_mass_denom = torch.zeros((), device=device)
-        # --- diagnostics to understand why top1_unsafe may not improve ---
-        top1_eq_gt_count = torch.zeros((), device=device)
-        top1_eq_gt_total = torch.zeros((), device=device)
-
-        gt_unsafe_count = torch.zeros((), device=device)
-        gt_total_count = torch.zeros((), device=device)
-
-        top1_unsafe_non_gt_count = torch.zeros((), device=device)
-        top1_non_gt_total = torch.zeros((), device=device)
 
         K = int(self.sft_ul_top_k)
         eps = 1e-6
@@ -629,26 +617,6 @@ class PlanR1(pl.LightningModule):
             )  # [B]
             top1_unsafe_count = top1_unsafe_count + (top1_unsafe_b & valid_b).sum().float()
             top1_total_count = top1_total_count + valid_b.sum().float()
-
-            # --- diagnostics ---
-            gt_tok_step = target_ego[:, t]  # [B]
-
-            # (1) top1 == GT rate
-            eq_gt_b = (top1_tok == gt_tok_step) & valid_b
-            top1_eq_gt_count = top1_eq_gt_count + eq_gt_b.sum().float()
-            top1_eq_gt_total = top1_eq_gt_total + valid_b.sum().float()
-
-            # (2) GT unsafe rate under the same one-step checker (diagnostic only; GT is not penalized by UL)
-            gt_unsafe_b = self._unsafe_one_step_for_ego(
-                data=data, ego_index=ego_index, j=j, ego_tokens=gt_tok_step
-            )  # [B]
-            gt_unsafe_count = gt_unsafe_count + (gt_unsafe_b & valid_b).sum().float()
-            gt_total_count = gt_total_count + valid_b.sum().float()
-
-            # (3) top1 unsafe rate restricted to positions where top1 != GT
-            non_gt_top1_b = (top1_tok != gt_tok_step) & valid_b
-            top1_unsafe_non_gt_count = top1_unsafe_non_gt_count + (top1_unsafe_b & non_gt_top1_b).sum().float()
-            top1_non_gt_total = top1_non_gt_total + non_gt_top1_b.sum().float()
 
             # unsafe probability mass denominator counts valid (b,t)
             unsafe_mass_denom = unsafe_mass_denom + valid_b.sum().float()
@@ -702,21 +670,12 @@ class PlanR1(pl.LightningModule):
         unsafe_frac = unsafe_term_count / checked_term_count.clamp(min=1.0)
         top1_unsafe_rate = top1_unsafe_count / top1_total_count.clamp(min=1.0)
         unsafe_prob_mass = unsafe_mass_total / unsafe_mass_denom.clamp(min=1.0)
-        # --- diagnostics ---
-        top1_eq_gt_rate = top1_eq_gt_count / top1_eq_gt_total.clamp(min=1.0)
-        gt_unsafe_rate = gt_unsafe_count / gt_total_count.clamp(min=1.0)
-        top1_unsafe_rate_non_gt = top1_unsafe_non_gt_count / top1_non_gt_total.clamp(min=1.0)
-
 
         return ul_loss, {
             'hit_rate': hit_rate.detach(),
             'unsafe_frac': unsafe_frac.detach(),
             'top1_unsafe_rate': top1_unsafe_rate.detach(),
             'unsafe_prob_mass': unsafe_prob_mass.detach(),
-            # diagnostics
-            'top1_eq_gt_rate': top1_eq_gt_rate.detach(),
-            'gt_unsafe_rate': gt_unsafe_rate.detach(),
-            'top1_unsafe_rate_non_gt': top1_unsafe_rate_non_gt.detach(),
         }
     def _unsafe_one_step_for_ego(self, data: Batch, ego_index: torch.Tensor, j: int, ego_tokens: torch.Tensor) -> torch.Tensor:
         """One-step unsafe check for ego at future interval index j (j in [H, H+F-1]).

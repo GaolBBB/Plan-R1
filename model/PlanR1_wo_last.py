@@ -1,3 +1,4 @@
+# 消融掉了对上一步惩罚
 import pytorch_lightning as pl
 import torch
 import torch.nn as nn
@@ -241,17 +242,17 @@ class PlanR1(pl.LightningModule):
                     neg_w[b0, t0v] = 1.0  # weight for first done step
 
                     # backtrack: penalize t0-1 with gamma (and optionally more steps with gamma^l)
-                    L = int(self.rft_ul_backtrack_steps)
-                    gamma = float(self.rft_ul_backtrack_gamma)
-                    for l in range(1, L + 1):
-                        bt_mask = has_done & (t0 >= l)
-                        if not bool(bt_mask.any()):
-                            continue
-                        b_bt = b_idx[bt_mask]
-                        t_bt = t0[bt_mask] - l
-                        w_bt = gamma ** l
-                        prev = neg_w[b_bt, t_bt]
-                        neg_w[b_bt, t_bt] = torch.maximum(prev, torch.full_like(prev, w_bt))
+                    # L = int(self.rft_ul_backtrack_steps)
+                    # gamma = float(self.rft_ul_backtrack_gamma)
+                    # for l in range(1, L + 1):
+                    #     bt_mask = has_done & (t0 >= l)
+                    #     if not bool(bt_mask.any()):
+                    #         continue
+                    #     b_bt = b_idx[bt_mask]
+                    #     t_bt = t0[bt_mask] - l
+                    #     w_bt = gamma ** l
+                    #     prev = neg_w[b_bt, t_bt]
+                    #     neg_w[b_bt, t_bt] = torch.maximum(prev, torch.full_like(prev, w_bt))
 
                 # ---------- (2) near-miss: TTC < threshold ----------
                 # Expect ttc_reward to be [B, T]. If shape differs, tell me and we'll adapt.

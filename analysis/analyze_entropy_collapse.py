@@ -173,7 +173,6 @@ if __name__ == "__main__":
     main(sys.argv[1])
 
 # (planr1) gaosunxiang@admin123-ESC8000A-E12:~/Plan-R1/analysis$ python analyze_entropy_collapse.py /home/gaosunxiang/Plan-R1/lightning_logs/plan/version_0/metrics.csv
-
 # ===== Entropy Collapse Check =====
 # baseline_entropy_mean(first_10%): 1.9967834183147974
 # tail_entropy_mean(last_20%): 1.5925783493689127
